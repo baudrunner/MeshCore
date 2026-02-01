@@ -63,6 +63,30 @@
 #define OFFLINE_QUEUE_SIZE 16
 #endif
 
+#ifndef BOARD_CHANNEL_NAME
+#define BOARD_CHANNEL_NAME "#bboard8"
+#endif
+
+#ifndef BOARD_MAX_ENTRIES
+#define BOARD_MAX_ENTRIES 8
+#endif
+
+#ifndef BOARD_SENDER_MAX_LEN
+#define BOARD_SENDER_MAX_LEN 32
+#endif
+
+#ifndef BOARD_MSG_MAX_LEN
+#define BOARD_MSG_MAX_LEN 120
+#endif
+
+#ifndef BOARD_GETN_RATE_LIMIT_MS
+#define BOARD_GETN_RATE_LIMIT_MS 30000UL
+#endif
+
+#ifndef BOARD_ACK_DELAY_MS
+#define BOARD_ACK_DELAY_MS 4000
+#endif
+
 #ifndef BLE_NAME_PREFIX
 #define BLE_NAME_PREFIX "MeshCore-"
 #endif
@@ -167,6 +191,12 @@ private:
   void updateContactFromFrame(ContactInfo &contact, uint32_t& last_mod, const uint8_t *frame, int len);
   void addToOfflineQueue(const uint8_t frame[], int len);
   int getFromOfflineQueue(uint8_t frame[]);
+  bool isBoardChannel(uint8_t channel_idx, ChannelDetails& details);
+  bool splitBoardSenderAndMessage(const char* text, char* sender, size_t sender_len, char* msg, size_t msg_len) const;
+  void recordBoardMessage(const char* sender, uint32_t timestamp, const char* msg);
+  bool sendBoardChannelText(const mesh::GroupChannel& channel, const char* text);
+  bool isBoardHistoryResponse(const char* sender, const char* msg) const;
+  void handleBoardChannelMessage(uint8_t channel_idx, uint32_t timestamp, const char* text);
   int getBlobByKey(const uint8_t key[], int key_len, uint8_t dest_buf[]) override { 
     return _store->getBlobByKey(key, key_len, dest_buf);
   }
@@ -216,6 +246,28 @@ private:
   };
   int offline_queue_len;
   Frame offline_queue[OFFLINE_QUEUE_SIZE];
+
+  struct BoardEntry {
+    char sender[BOARD_SENDER_MAX_LEN];
+    uint32_t timestamp;
+    char text[BOARD_MSG_MAX_LEN];
+  };
+
+  struct BoardSenderState {
+    char sender[BOARD_SENDER_MAX_LEN];
+    uint32_t last_get_ms;
+    uint32_t last_seen_ms;
+    bool has_posted;
+  };
+
+  uint8_t board_head;
+  uint8_t board_count;
+  uint8_t board_sender_count;
+  bool board_ack_pending;
+  uint8_t board_ack_channel_idx;
+  unsigned long board_ack_due_ms;
+  BoardEntry board_entries[BOARD_MAX_ENTRIES];
+  BoardSenderState board_senders[BOARD_MAX_ENTRIES];
 
   struct AckTableEntry {
     unsigned long msg_sent;

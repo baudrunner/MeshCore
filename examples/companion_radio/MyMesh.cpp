@@ -242,6 +242,205 @@ int MyMesh::getFromOfflineQueue(uint8_t frame[]) {
   return 0; // queue is empty
 }
 
+bool MyMesh::isBoardChannel(uint8_t channel_idx, ChannelDetails& details) {
+  if (!getChannel(channel_idx, details)) {
+    return false;
+  }
+  return strcmp(details.name, BOARD_CHANNEL_NAME) == 0;
+}
+
+bool MyMesh::splitBoardSenderAndMessage(const char* text, char* sender, size_t sender_len, char* msg, size_t msg_len) const {
+  if (!text || !sender || !msg || sender_len == 0 || msg_len == 0) {
+    return false;
+  }
+
+  sender[0] = 0;
+  msg[0] = 0;
+
+  const char* sep = strstr(text, ": ");
+  if (!sep) {
+    sep = strchr(text, ':');
+  }
+
+  if (sep) {
+    size_t s_len = sep - text;
+    if (s_len >= sender_len) {
+      s_len = sender_len - 1;
+    }
+    memcpy(sender, text, s_len);
+    sender[s_len] = 0;
+
+    const char* msg_start = sep + 1;
+    if (*msg_start == ' ') {
+      msg_start++;
+    }
+    StrHelper::strzcpy(msg, msg_start, msg_len);
+    return true;
+  }
+
+  StrHelper::strzcpy(sender, "unknown", sender_len);
+  StrHelper::strzcpy(msg, text, msg_len);
+  return false;
+}
+
+void MyMesh::recordBoardMessage(const char* sender, uint32_t timestamp, const char* msg) {
+  if (!sender || !msg || !*msg) {
+    return;
+  }
+
+  BoardEntry& entry = board_entries[board_head];
+  StrHelper::strzcpy(entry.sender, sender, sizeof(entry.sender));
+  entry.timestamp = timestamp;
+  StrHelper::strzcpy(entry.text, msg, sizeof(entry.text));
+
+  board_head = (board_head + 1) % BOARD_MAX_ENTRIES;
+  if (board_count < BOARD_MAX_ENTRIES) {
+    board_count++;
+  }
+
+  uint32_t now = millis();
+  uint8_t oldest_idx = 0;
+  uint32_t oldest_seen = 0xFFFFFFFF;
+
+  for (uint8_t i = 0; i < board_sender_count; i++) {
+    if (strcmp(board_senders[i].sender, sender) == 0) {
+      board_senders[i].has_posted = true;
+      board_senders[i].last_seen_ms = now;
+      return;
+    }
+    if (board_senders[i].last_seen_ms < oldest_seen) {
+      oldest_seen = board_senders[i].last_seen_ms;
+      oldest_idx = i;
+    }
+  }
+
+  uint8_t slot = 0;
+  if (board_sender_count < BOARD_MAX_ENTRIES) {
+    slot = board_sender_count++;
+  } else {
+    slot = oldest_idx;
+  }
+
+  BoardSenderState& st = board_senders[slot];
+  StrHelper::strzcpy(st.sender, sender, sizeof(st.sender));
+  st.last_get_ms = 0;
+  st.last_seen_ms = now;
+  st.has_posted = true;
+}
+
+bool MyMesh::sendBoardChannelText(const mesh::GroupChannel& channel, const char* text) {
+  if (!text) {
+    return false;
+  }
+
+  int text_len = strlen(text);
+  return sendGroupMessage(getRTCClock()->getCurrentTimeUnique(), const_cast<mesh::GroupChannel&>(channel),
+                          _prefs.node_name, text, text_len);
+}
+
+bool MyMesh::isBoardHistoryResponse(const char* sender, const char* msg) const {
+  if (!sender || !msg) {
+    return false;
+  }
+  if (strcmp(sender, _prefs.node_name) != 0) {
+    return false;
+  }
+
+  const char* suffix = strrchr(msg, '(');
+  if (!suffix || suffix == msg) {
+    return false;
+  }
+  if (suffix > msg && *(suffix - 1) != ' ') {
+    return false;
+  }
+
+  int i = 1; // after '('
+  if (!isdigit((unsigned char)suffix[i])) return false;
+  while (isdigit((unsigned char)suffix[i])) i++;
+  if (suffix[i] != '/') return false;
+  i++;
+  if (!isdigit((unsigned char)suffix[i])) return false;
+  while (isdigit((unsigned char)suffix[i])) i++;
+  if (suffix[i] != ')') return false;
+  return suffix[i + 1] == 0;
+}
+
+void MyMesh::handleBoardChannelMessage(uint8_t channel_idx, uint32_t timestamp, const char* text) {
+  ChannelDetails details;
+  if (!isBoardChannel(channel_idx, details)) {
+    return;
+  }
+
+  char sender[BOARD_SENDER_MAX_LEN];
+  char msg[BOARD_MSG_MAX_LEN];
+  splitBoardSenderAndMessage(text, sender, sizeof(sender), msg, sizeof(msg));
+
+  if (msg[0] == 0) {
+    return;
+  }
+
+  if (strcmp(msg, "k") == 0) {  // no ACKs on ACKs and never store
+    return;
+  }
+
+  if (isBoardHistoryResponse(sender, msg)) {
+    return; // ignore our own history responses
+  }
+
+  if (strncmp(msg, "/get", 4) == 0) {
+    char* endp = NULL;
+    long n = strtol(msg + 4, &endp, 10);
+    if (!endp || *endp != 0 || n < 1) {
+      return;
+    }
+    if (n > BOARD_MAX_ENTRIES) {
+      n = BOARD_MAX_ENTRIES;
+    }
+
+    BoardSenderState* st = NULL;
+    for (uint8_t i = 0; i < board_sender_count; i++) {
+      if (strcmp(board_senders[i].sender, sender) == 0) {
+        st = &board_senders[i];
+        break;
+      }
+    }
+    if (!st || !st->has_posted) {
+      return;
+    }
+
+    uint32_t now = millis();
+    if (st->last_get_ms && (now - st->last_get_ms) < BOARD_GETN_RATE_LIMIT_MS) {
+      return;
+    }
+    st->last_get_ms = now;
+    st->last_seen_ms = now;
+
+    int available = board_count;
+    if (available <= 0) {
+      return;
+    }
+
+    int send_count = (n < available) ? n : available;
+    int oldest = (board_head + BOARD_MAX_ENTRIES - board_count) % BOARD_MAX_ENTRIES;
+    int start = (oldest + (board_count - send_count)) % BOARD_MAX_ENTRIES;
+
+    for (int i = 0; i < send_count; i++) {
+      BoardEntry& e = board_entries[(start + i) % BOARD_MAX_ENTRIES];
+      char reply[BOARD_MSG_MAX_LEN + 64];
+      snprintf(reply, sizeof(reply), "%s: %s (%d/%d)", e.sender, e.text, i + 1, send_count);
+      sendBoardChannelText(details.channel, reply);
+    }
+    return; // no ACKs on /getN
+  }
+
+  recordBoardMessage(sender, timestamp, msg);
+  if (!board_ack_pending) {
+    board_ack_pending = true;
+    board_ack_channel_idx = channel_idx;
+    board_ack_due_ms = futureMillis(BOARD_ACK_DELAY_MS);
+  }
+}
+
 float MyMesh::getAirtimeBudgetFactor() const {
   return _prefs.airtime_factor;
 }
@@ -539,6 +738,8 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
     if (!_prefs.buzzer_quiet) _ui->notify(UIEventType::channelMessage); //buzz if enabled
   }
 #endif
+
+  handleBoardChannelMessage(channel_idx, timestamp, text);
 }
 
 uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_timestamp, const uint8_t *data,
@@ -779,6 +980,12 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   _iter_started = false;
   _cli_rescue = false;
   offline_queue_len = 0;
+  board_head = 0;
+  board_count = 0;
+  board_sender_count = 0;
+  board_ack_pending = false;
+  board_ack_channel_idx = 0;
+  board_ack_due_ms = 0;
   app_target_ver = 0;
   clearPendingReqs();
   next_ack_idx = 0;
@@ -786,6 +993,8 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   dirty_contacts_expiry = 0;
   memset(advert_paths, 0, sizeof(advert_paths));
   memset(send_scope.key, 0, sizeof(send_scope.key));
+  memset(board_entries, 0, sizeof(board_entries));
+  memset(board_senders, 0, sizeof(board_senders));
 
   // defaults
   memset(&_prefs, 0, sizeof(_prefs));
@@ -1959,6 +2168,14 @@ void MyMesh::loop() {
   if (dirty_contacts_expiry && millisHasNowPassed(dirty_contacts_expiry)) {
     saveContacts();
     dirty_contacts_expiry = 0;
+  }
+
+  if (board_ack_pending && millisHasNowPassed(board_ack_due_ms)) {
+    ChannelDetails details;
+    if (isBoardChannel(board_ack_channel_idx, details)) {
+      sendBoardChannelText(details.channel, "k");
+    }
+    board_ack_pending = false;
   }
 
 #ifdef DISPLAY_CLASS
